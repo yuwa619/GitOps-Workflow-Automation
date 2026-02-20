@@ -23,12 +23,8 @@ def get_sum():
 def reverse_string():
     data = request.get_json(silent=True) or {}
     text = data.get('text', "")
-    if not isinstance(text, str):
-        return jsonify({"error": "text must be a string"}), 400
     return jsonify({"result": text[::-1]})
 
 
 if __name__ == '__main__':
     app.run()
-
-import os
