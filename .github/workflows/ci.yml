@@ -14,7 +14,100 @@ permissions:
   contents: read
 
 jobs:
-  # ── Core build & test pipeline ─────────────────────────────────────────────
+  # ── 1. Trello: move card to In Progress on PR open/push ───────────────────
+  trello-in-progress:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    if: >
+      github.event_name == 'pull_request' &&
+      github.event.action != 'closed' &&
+      (
+        github.event.action == 'opened' ||
+        github.event.action == 'synchronize' ||
+        github.event.action == 'reopened' ||
+        github.event.action == 'ready_for_review'
+      )
+    steps:
+      - name: Create card (if missing) and move to In Progress
+        env:
+          TRELLO_KEY:        ${{ secrets.TRELLO_KEY }}
+          TRELLO_TOKEN:      ${{ secrets.TRELLO_TOKEN }}
+          TRELLO_BOARD_ID:   ${{ secrets.TRELLO_BOARD_ID }}
+          LIST_BACKLOG:      ${{ secrets.TRELLO_LIST_BACKLOG }}
+          LIST_IN_PROGRESS:  ${{ secrets.TRELLO_LIST_IN_PROGRESS }}
+          PR_TITLE:          ${{ github.event.pull_request.title }}
+          PR_URL:            ${{ github.event.pull_request.html_url }}
+          PR_NUMBER:         ${{ github.event.pull_request.number }}
+          REPO:              ${{ github.repository }}
+          EVENT_ACTION:      ${{ github.event.action }}
+          COMMIT_SHA:        ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          CARDS_JSON="$(curl -sS \
+            "https://api.trello.com/1/boards/${TRELLO_BOARD_ID}/cards?fields=name,desc&key=${TRELLO_KEY}&token=${TRELLO_TOKEN}")"
+
+          CARD_ID="$(echo "$CARDS_JSON" | python3 -c "
+          import os,sys,json
+          pr=os.environ['PR_URL']
+          cards=json.load(sys.stdin)
+          print(next((c['id'] for c in cards if pr in (c.get('desc') or '')), ''))
+          ")"
+
+          if [ -z "$CARD_ID" ]; then
+            NEXT_NUM="$(echo "$CARDS_JSON" | python3 -c "
+          import sys,json,re
+          cards=json.load(sys.stdin)
+          nums=[int(m.group(1)) for c in cards for m in [re.search(r'TRELLO-(\d+)',c.get('name',''))] if m]
+          print(max(nums,default=0)+1)
+            ")"
+
+            TID="TRELLO-$(printf '%03d' "$NEXT_NUM")"
+
+            CLEAN_TITLE="$(echo "$PR_TITLE" | python3 -c "
+          import sys,re
+          t=sys.stdin.read().strip()
+          t=re.sub(r'^TRELLO-\d+\s*[-]\s*','',t,flags=re.IGNORECASE)
+          print(t)
+            ")"
+
+            CARD_NAME="${TID} - ${CLEAN_TITLE}"
+            CARD_DESC="Auto-created by GitHub Actions.\nPR: ${PR_URL}\nRepo: ${REPO}\nPR#: ${PR_NUMBER}"
+
+            CARD_ID="$(curl -sS -X POST \
+              --data-urlencode "idList=${LIST_BACKLOG}" \
+              --data-urlencode "name=${CARD_NAME}" \
+              --data-urlencode "desc=${CARD_DESC}" \
+              "https://api.trello.com/1/cards?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}" \
+              | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")"
+            echo "Created Trello card: $CARD_NAME ($CARD_ID)"
+          else
+            echo "Found existing card: $CARD_ID"
+          fi
+
+          curl -sS -X PUT \
+            "https://api.trello.com/1/cards/${CARD_ID}?idList=${LIST_IN_PROGRESS}&key=${TRELLO_KEY}&token=${TRELLO_TOKEN}" \
+            > /dev/null
+          echo "Moved card to In Progress."
+
+          EVENT_DATE="$(date -u '+%Y-%m-%d %H:%M UTC')"
+          SHORT_SHA="${COMMIT_SHA:0:7}"
+          if [ "$EVENT_ACTION" = "opened" ]; then
+            TRIGGER="PR #${PR_NUMBER} opened"
+          elif [ "$EVENT_ACTION" = "synchronize" ]; then
+            TRIGGER="new commit pushed (${SHORT_SHA})"
+          else
+            TRIGGER="PR ${EVENT_ACTION}"
+          fi
+          COMMENT="Moved to In Progress on ${EVENT_DATE} | Trigger: ${TRIGGER} | PR: #${PR_NUMBER} ${PR_URL}"
+
+          curl -sS -X POST \
+            --data-urlencode "text=${COMMENT}" \
+            "https://api.trello.com/1/cards/${CARD_ID}/actions/comments?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}" \
+            > /dev/null
+          echo "Posted In Progress comment."
+
+  # ── 2. Core build & test pipeline ─────────────────────────────────────────
   build-test:
     runs-on: ubuntu-latest
     if: github.event.action != 'closed'
@@ -36,3 +129,237 @@ jobs:
 
       - name: Test
         run: pytest test_app.py -v
+
+  # ── 3. CI passed → Review/QA ──────────────────────────────────────────────
+  trello-review-qa:
+    needs: build-test
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    if: >
+      success() &&
+      github.event_name == 'pull_request' &&
+      github.event.action != 'closed'
+    steps:
+      - name: Move card to Review/QA and post CI passed comment
+        env:
+          TRELLO_KEY:      ${{ secrets.TRELLO_KEY }}
+          TRELLO_TOKEN:    ${{ secrets.TRELLO_TOKEN }}
+          TRELLO_BOARD_ID: ${{ secrets.TRELLO_BOARD_ID }}
+          LIST_REVIEW_QA:  ${{ secrets.TRELLO_LIST_REVIEW_QA }}
+          PR_URL:          ${{ github.event.pull_request.html_url }}
+          PR_NUMBER:       ${{ github.event.pull_request.number }}
+          COMMIT_SHA:      ${{ github.event.pull_request.head.sha }}
+          RUN_URL:         ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          CARDS_JSON="$(curl -sS \
+            "https://api.trello.com/1/boards/${TRELLO_BOARD_ID}/cards?fields=name,desc&key=${TRELLO_KEY}&token=${TRELLO_TOKEN}")"
+
+          CARD_ID="$(echo "$CARDS_JSON" | python3 -c "
+          import os,sys,json
+          pr=os.environ['PR_URL']
+          cards=json.load(sys.stdin)
+          print(next((c['id'] for c in cards if pr in (c.get('desc') or '')), ''))
+          ")"
+
+          if [ -z "$CARD_ID" ]; then
+            echo "No card found for this PR — skipping."
+            exit 0
+          fi
+
+          curl -sS -X PUT \
+            "https://api.trello.com/1/cards/${CARD_ID}?idList=${LIST_REVIEW_QA}&key=${TRELLO_KEY}&token=${TRELLO_TOKEN}" \
+            > /dev/null
+          echo "Moved card to Review/QA."
+
+          EVENT_DATE="$(date -u '+%Y-%m-%d %H:%M UTC')"
+          SHORT_SHA="${COMMIT_SHA:0:7}"
+          COMMENT="CI PASSED - Moved to Review/QA on ${EVENT_DATE} | Commit: ${SHORT_SHA} | Run: ${RUN_URL} | PR: #${PR_NUMBER} ${PR_URL}"
+
+          curl -sS -X POST \
+            --data-urlencode "text=${COMMENT}" \
+            "https://api.trello.com/1/cards/${CARD_ID}/actions/comments?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}" \
+            > /dev/null
+          echo "Posted Review/QA comment."
+
+  # ── 4. CI failed → back to In Progress + red label ────────────────────────
+  trello-ci-failed:
+    needs: build-test
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    if: >
+      failure() &&
+      github.event_name == 'pull_request' &&
+      github.event.action != 'closed'
+    steps:
+      - name: Move card back to In Progress, add red label, post failure comment
+        env:
+          TRELLO_KEY:       ${{ secrets.TRELLO_KEY }}
+          TRELLO_TOKEN:     ${{ secrets.TRELLO_TOKEN }}
+          TRELLO_BOARD_ID:  ${{ secrets.TRELLO_BOARD_ID }}
+          LIST_IN_PROGRESS: ${{ secrets.TRELLO_LIST_IN_PROGRESS }}
+          PR_URL:           ${{ github.event.pull_request.html_url }}
+          PR_NUMBER:        ${{ github.event.pull_request.number }}
+          COMMIT_SHA:       ${{ github.event.pull_request.head.sha }}
+          RUN_URL:          ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          CARDS_JSON="$(curl -sS \
+            "https://api.trello.com/1/boards/${TRELLO_BOARD_ID}/cards?fields=name,desc&key=${TRELLO_KEY}&token=${TRELLO_TOKEN}")"
+
+          CARD_ID="$(echo "$CARDS_JSON" | python3 -c "
+          import os,sys,json
+          pr=os.environ['PR_URL']
+          cards=json.load(sys.stdin)
+          print(next((c['id'] for c in cards if pr in (c.get('desc') or '')), ''))
+          ")"
+
+          if [ -z "$CARD_ID" ]; then
+            echo "No card found for this PR — skipping."
+            exit 0
+          fi
+
+          curl -sS -X PUT \
+            "https://api.trello.com/1/cards/${CARD_ID}?idList=${LIST_IN_PROGRESS}&key=${TRELLO_KEY}&token=${TRELLO_TOKEN}" \
+            > /dev/null
+          echo "Moved card back to In Progress (CI failed)."
+
+          LABELS_JSON="$(curl -sS \
+            "https://api.trello.com/1/boards/${TRELLO_BOARD_ID}/labels?fields=id,name,color&key=${TRELLO_KEY}&token=${TRELLO_TOKEN}")"
+
+          RED_LABEL_ID="$(echo "$LABELS_JSON" | python3 -c "
+          import sys,json
+          labels=json.load(sys.stdin)
+          match=[l['id'] for l in labels if l.get('color')=='red' and l.get('name')=='CI Failed']
+          print(match[0] if match else '')
+          ")"
+
+          if [ -z "$RED_LABEL_ID" ]; then
+            RED_LABEL_ID="$(curl -sS -X PUT \
+              "https://api.trello.com/1/labels/$(echo "$LABELS_JSON" | python3 -c "
+          import sys,json
+          labels=json.load(sys.stdin)
+          match=[l['id'] for l in labels if l.get('color')=='red']
+          print(match[0] if match else '')
+              ")?name=CI+Failed&color=red&key=${TRELLO_KEY}&token=${TRELLO_TOKEN}" \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('id',''))")"
+            echo "Renamed existing red label to CI Failed: $RED_LABEL_ID"
+          else
+            echo "Found red CI Failed label: $RED_LABEL_ID"
+          fi
+
+          if [ -n "$RED_LABEL_ID" ]; then
+            curl -sS -X POST \
+              "https://api.trello.com/1/cards/${CARD_ID}/idLabels?value=${RED_LABEL_ID}&key=${TRELLO_KEY}&token=${TRELLO_TOKEN}" \
+              > /dev/null 2>&1 || true
+            echo "Applied red label to card."
+          fi
+
+          EVENT_DATE="$(date -u '+%Y-%m-%d %H:%M UTC')"
+          SHORT_SHA="${COMMIT_SHA:0:7}"
+          COMMENT="CI FAILED - Moved back to In Progress on ${EVENT_DATE} | Commit: ${SHORT_SHA} | Run: ${RUN_URL} | PR: #${PR_NUMBER} ${PR_URL}"
+
+          curl -sS -X POST \
+            --data-urlencode "text=${COMMENT}" \
+            "https://api.trello.com/1/cards/${CARD_ID}/actions/comments?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}" \
+            > /dev/null
+          echo "Posted CI failure comment."
+
+  # ── 5. PR merged → Done + green label + merge comment ─────────────────────
+  trello-done:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    if: >
+      github.event_name == 'pull_request' &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true
+    steps:
+      - name: Move card to Done, add green label and merge comment
+        env:
+          TRELLO_KEY:      ${{ secrets.TRELLO_KEY }}
+          TRELLO_TOKEN:    ${{ secrets.TRELLO_TOKEN }}
+          TRELLO_BOARD_ID: ${{ secrets.TRELLO_BOARD_ID }}
+          LIST_DONE:       ${{ secrets.TRELLO_LIST_DONE }}
+          PR_URL:          ${{ github.event.pull_request.html_url }}
+          PR_NUMBER:       ${{ github.event.pull_request.number }}
+          PR_TITLE:        ${{ github.event.pull_request.title }}
+          MERGED_BY:       ${{ github.event.pull_request.merged_by.login }}
+          REPO:            ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          CARDS_JSON="$(curl -sS \
+            "https://api.trello.com/1/boards/${TRELLO_BOARD_ID}/cards?fields=name,desc&key=${TRELLO_KEY}&token=${TRELLO_TOKEN}")"
+
+          CARD_ID="$(echo "$CARDS_JSON" | python3 -c "
+          import os,sys,json
+          pr=os.environ['PR_URL']
+          cards=json.load(sys.stdin)
+          print(next((c['id'] for c in cards if pr in (c.get('desc') or '')), ''))
+          ")"
+
+          if [ -z "$CARD_ID" ]; then
+            echo "No card found for this PR — skipping."
+            exit 0
+          fi
+
+          curl -sS -X PUT \
+            "https://api.trello.com/1/cards/${CARD_ID}?idList=${LIST_DONE}&key=${TRELLO_KEY}&token=${TRELLO_TOKEN}" \
+            > /dev/null
+          echo "Moved card to Done."
+
+          LABELS_JSON="$(curl -sS \
+            "https://api.trello.com/1/boards/${TRELLO_BOARD_ID}/labels?fields=id,name,color&key=${TRELLO_KEY}&token=${TRELLO_TOKEN}")"
+
+          GREEN_LABEL_ID="$(echo "$LABELS_JSON" | python3 -c "
+          import sys,json
+          labels=json.load(sys.stdin)
+          match=[l['id'] for l in labels if l.get('color')=='green' and l.get('name')=='Completed']
+          print(match[0] if match else '')
+          ")"
+
+          if [ -z "$GREEN_LABEL_ID" ]; then
+            GREEN_LABEL_ID="$(curl -sS -X PUT \
+              "https://api.trello.com/1/labels/$(echo "$LABELS_JSON" | python3 -c "
+          import sys,json
+          labels=json.load(sys.stdin)
+          match=[l['id'] for l in labels if l.get('color')=='green']
+          print(match[0] if match else '')
+              ")?name=Completed&color=green&key=${TRELLO_KEY}&token=${TRELLO_TOKEN}" \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('id',''))")"
+            echo "Renamed existing green label to Completed: $GREEN_LABEL_ID"
+          else
+            echo "Found green Completed label: $GREEN_LABEL_ID"
+          fi
+
+          RED_LABEL_ID="$(echo "$LABELS_JSON" | python3 -c "
+          import sys,json
+          labels=json.load(sys.stdin)
+          match=[l['id'] for l in labels if l.get('color')=='red' and l.get('name')=='CI Failed']
+          print(match[0] if match else '')
+          ")"
+
+          if [ -n "$RED_LABEL_ID" ]; then
+            curl -sS -X DELETE \
+              "https://api.trello.com/1/cards/${CARD_ID}/idLabels/${RED_LABEL_ID}?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}" \
+              > /dev/null 2>&1 || true
+            echo "Removed red CI Failed label."
+          fi
+
+          if [ -n "$GREEN_LABEL_ID" ]; then
+            curl -sS -X POST \
+              "https://api.trello.com/1/cards/${CARD_ID}/idLabels?value=${GREEN_LABEL_ID}&key=${TRELLO_KEY}&token=${TRELLO_TOKEN}" \
+              > /dev/null 2>&1 || true
+            echo "Applied green Completed label to card."
+          fi
+
+          MERGE_DATE="$(date -u '+%Y-%m-%d %H:%M UTC')"
+          COMMENT="MERGED on ${MERGE_DATE} | PR: #${PR_NUMBER} - ${PR_TITLE} ${PR_URL} | Merged by: @${MERGED_BY} | Repo: ${REPO}"
+
+          curl -sS -X POST \
+            --data-urlencode "text=${COMMENT}" \
+            "https://api.trello.com/1/cards/${CARD_ID}/actions/comments?key=${TRELLO_KEY}&token=${TRELLO_TOKEN}" \
+            > /dev/null
+          echo "Posted merge comment on card."
