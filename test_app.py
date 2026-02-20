@@ -58,3 +58,13 @@ def test_reverse_invalid_type_returns_400(client):
     res = client.post('/reverse-string', json={"text": 123})
     assert res.status_code == 400
     assert "error" in res.get_json()
+
+
+def test_sum_with_floats(client):
+    res = client.post('/sum', json={"a": 1.5, "b": 2.5})
+    assert res.get_json()["result"] == 4.0
+
+
+def test_reverse_palindrome(client):
+    res = client.post('/reverse-string', json={"text": "racecar"})
+    assert res.get_json()["result"] == "racecar"
