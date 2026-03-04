@@ -1,6 +1,6 @@
 # GitOps Workflow & CI Automation
 
-![CI](https://github.com/yuwa619/GitOps-Workflow-CI-Automation-/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/yuwa619/GitOps-Workflow-Automation/actions/workflows/ci.yml/badge.svg)
 ![Python](https://img.shields.io/badge/python-3.10-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -120,8 +120,8 @@ Optional longer explanation of why this change was made.
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/yuwa619/GitOps-Workflow-CI-Automation-.git
-cd GitOps-Workflow-CI-Automation-
+git clone https://github.com/yuwa619/GitOps-Workflow-Automation.git
+cd GitOps-Workflow-Automation
 
 # 2. Create and activate a virtual environment
 python -m venv .venv
