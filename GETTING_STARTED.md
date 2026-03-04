@@ -23,8 +23,8 @@ You will also need:
 ## Step 1 — Clone the Repository (5 min)
 
 ```bash
-git clone https://github.com/yuwa619/GitOps-Workflow-CI-Automation-.git
-cd GitOps-Workflow-CI-Automation-
+git clone https://github.com/yuwa619/GitOps-Workflow-Automation.git
+cd GitOps-Workflow-Automation
 ```
 
 ---
